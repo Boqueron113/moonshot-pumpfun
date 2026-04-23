@@ -1,13 +1,14 @@
 // ═══════════════════════════════════════════════════════════════════════════
-// MOONSHOT €20 — PumpFun bot v7 (Moralis API)
-// Endpoint real de tokens nuevos de PumpFun con datos completos
+// MOONSHOT €20 — PumpFun bot v8 — ROTACIÓN CONTINUA
+// SL -20% · TP +25% · Tiempo máximo 1h por posición
+// Capital siempre en movimiento
 // ═══════════════════════════════════════════════════════════════════════════
 
 const express = require('express');
-const axios = require('axios');
-const cors = require('cors');
+const axios   = require('axios');
+const cors    = require('cors');
 const { Connection, Keypair, VersionedTransaction } = require('@solana/web3.js');
-const bs58 = require('bs58');
+const bs58    = require('bs58');
 
 const app = express();
 app.use(cors());
@@ -19,30 +20,33 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID   = process.env.TELEGRAM_CHAT_ID;
 const MORALIS_API_KEY    = process.env.MORALIS_API_KEY;
 
-const SOL_PER_TRADE  = 0.006;
+const SOL_PER_TRADE  = 0.006;  // ~€0.53 por trade
 const MAX_POSITIONS  = 15;
 const RESERVE_SOL    = 0.02;
-const SCAN_INTERVAL  = 60000; // 1 min
+const SCAN_INTERVAL  = 45000;  // scan cada 45s
 
-const TP1_PERCENT    = 40;
-const TP2_PERCENT    = 120;
-const TP3_PERCENT    = 300;
-const SL_PERCENT     = -35;
-const TRAIL_ACTIVATE = 80;
-const TRAIL_DROP     = 25;
+// ── ROTACIÓN CONTINUA ──────────────────────────────────────────────────────
+const TP1_PERCENT    = 25;     // +25% → vende 50% (rápido)
+const TP2_PERCENT    = 80;     // +80% → vende resto
+const TP3_PERCENT    = 200;    // +200% → moonshot (raro pero posible)
+const SL_PERCENT     = -20;    // -20% → stop loss rápido
+const MAX_HOLD_MS    = 60 * 60 * 1000; // 1 hora máximo por posición
+const TRAIL_ACTIVATE = 50;     // trailing desde +50%
+const TRAIL_DROP     = 15;     // vende si cae 15% desde peak
 
-// Filtros
-const MIN_LIQUIDITY_USD  = 3000;
-const MIN_AGE_MINUTES    = 3;
-const MAX_AGE_MINUTES    = 30;
-const MIN_VOLUME_1H_USD  = 3000;
+// Vault
+const VAULT_TP1 = 0.3;
+const VAULT_TP2 = 0.5;
+const VAULT_TP3 = 0.7;
+
+// ── FILTROS ────────────────────────────────────────────────────────────────
+const MIN_LIQUIDITY_USD = 3000;
+const MIN_AGE_MINUTES   = 3;
+const MAX_AGE_MINUTES   = 30;
+const MIN_VOLUME_1H_USD = 3000;
 const MAX_MCAP_LIQ_RATIO = 15;
-const MIN_PRICE_CHANGE   = 2;
-const MAX_PRICE_CHANGE   = 500;
-
-const VAULT_TP1 = 0.5;
-const VAULT_TP2 = 0.6;
-const VAULT_TP3 = 0.75;
+const MIN_PRICE_CHANGE  = 2;
+const MAX_PRICE_CHANGE  = 500;
 
 // ── SETUP ──────────────────────────────────────────────────────────────────
 const connection = new Connection('https://api.mainnet-beta.solana.com', 'confirmed');
@@ -58,10 +62,11 @@ let botPaused    = false;
 let totalScans   = 0;
 let totalBuys    = 0;
 let totalSkips   = 0;
+let totalExpired = 0;
 
 // ── TELEGRAM ───────────────────────────────────────────────────────────────
 async function notify(msg) {
-  console.log(`[ALERT] ${msg.replace(/\*/g, '').replace(/`/g, '')}`);
+  console.log(`[ALERT] ${msg.replace(/\*/g,'').replace(/`/g,'')}`);
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
   try {
     await axios.post(
@@ -84,35 +89,28 @@ function scoreToken(ageMin, liq, ratio, change5m) {
 // ── FILTROS ────────────────────────────────────────────────────────────────
 function filterToken(token) {
   const fails = [];
-
-  // Edad — Moralis devuelve createdAt en ISO o timestamp
   const createdAt = token.createdAt
     ? (typeof token.createdAt === 'string' ? new Date(token.createdAt).getTime() : token.createdAt)
     : null;
   const ageMin = createdAt ? (Date.now() - createdAt) / 60000 : 999;
 
-  if (ageMin < MIN_AGE_MINUTES) fails.push(`joven:${ageMin.toFixed(1)}m`);
-  if (ageMin > MAX_AGE_MINUTES) fails.push(`viejo:${ageMin.toFixed(0)}m`);
+  if (ageMin < MIN_AGE_MINUTES)  fails.push(`joven:${ageMin.toFixed(1)}m`);
+  if (ageMin > MAX_AGE_MINUTES)  fails.push(`viejo:${ageMin.toFixed(0)}m`);
 
-  // Liquidez
-  const liq = parseFloat(token.liquidity) || parseFloat(token.liquidityUsd) || 0;
-  if (liq < MIN_LIQUIDITY_USD) fails.push(`liq:$${Math.round(liq)}`);
+  const liq   = parseFloat(token.liquidity) || parseFloat(token.liquidityUsd) || 0;
+  if (liq < MIN_LIQUIDITY_USD)   fails.push(`liq:$${Math.round(liq)}`);
 
-  // Volumen en 1h (si está disponible)
   const vol1h = parseFloat(token.volume1h) || parseFloat(token.volume?.h1) || 0;
   if (vol1h > 0 && vol1h < MIN_VOLUME_1H_USD) fails.push(`vol:$${Math.round(vol1h)}`);
 
-  // Market cap ratio
-  const mcap = parseFloat(token.marketCap) || parseFloat(token.fullyDilutedValuation) || 0;
+  const mcap  = parseFloat(token.marketCap) || parseFloat(token.fullyDilutedValuation) || 0;
   const ratio = liq > 0 ? mcap / liq : 999;
   if (ratio > MAX_MCAP_LIQ_RATIO) fails.push(`ratio:${ratio.toFixed(1)}x`);
 
-  // Momentum (si está disponible)
   const change5m = parseFloat(token.priceChange5m) || parseFloat(token.priceChange?.m5) || 0;
-  // No fallar si no hay datos de momentum (algunos tokens nuevos no tienen)
   if (change5m !== 0) {
-    if (change5m < MIN_PRICE_CHANGE) fails.push(`mom:${change5m.toFixed(1)}%`);
-    if (change5m > MAX_PRICE_CHANGE) fails.push(`tarde:${change5m.toFixed(0)}%`);
+    if (change5m < MIN_PRICE_CHANGE)  fails.push(`mom:${change5m.toFixed(1)}%`);
+    if (change5m > MAX_PRICE_CHANGE)  fails.push(`tarde:${change5m.toFixed(0)}%`);
   }
 
   return {
@@ -154,13 +152,10 @@ async function getSolBalance() {
   catch { return 0; }
 }
 
-// ── SCAN v7 — Moralis API ─────────────────────────────────────────────────
+// ── SCAN ───────────────────────────────────────────────────────────────────
 async function scanRecentTokens() {
   if (botPaused || positions.size >= MAX_POSITIONS) return;
-  if (!MORALIS_API_KEY) {
-    console.log('[ERROR] Falta MORALIS_API_KEY en variables');
-    return;
-  }
+  if (!MORALIS_API_KEY) { console.log('[ERROR] Falta MORALIS_API_KEY'); return; }
 
   const balance = await getSolBalance();
   if (balance - SOL_PER_TRADE < RESERVE_SOL) {
@@ -170,42 +165,36 @@ async function scanRecentTokens() {
   }
 
   totalScans++;
-  console.log(`\n[SCAN #${totalScans}] Moralis PumpFun · ${positions.size} posiciones`);
+  console.log(`\n[SCAN #${totalScans}] ${positions.size} pos · balance:${balance.toFixed(3)} SOL · vault:${vaultSol.toFixed(3)}`);
 
   try {
-    // Endpoint Moralis: tokens nuevos en PumpFun
     const { data } = await axios.get(
       'https://solana-gateway.moralis.io/token/mainnet/exchange/pumpfun/new',
       {
         params: { limit: 100 },
-        headers: {
-          'Accept': 'application/json',
-          'X-API-Key': MORALIS_API_KEY,
-        },
+        headers: { 'Accept': 'application/json', 'X-API-Key': MORALIS_API_KEY },
         timeout: 10000,
       }
     );
 
     const tokens = data.result || data.tokens || (Array.isArray(data) ? data : []);
-    console.log(`[SCAN] Moralis devolvió ${tokens.length} tokens`);
+    console.log(`[SCAN] Moralis: ${tokens.length} tokens`);
 
     const candidates = [];
     for (const token of tokens) {
       const mint = token.tokenAddress || token.mint || token.address;
       if (!mint || seenTokens.has(mint)) continue;
-
       const check = filterToken(token);
       if (check.ok) {
         candidates.push({ token, check, mint });
       } else {
         totalSkips++;
-        const sym = token.symbol || token.name || '?';
-        console.log(`[SKIP] ${String(sym).padEnd(12)} ${check.fails.join(' · ')}`);
+        console.log(`[SKIP] ${String(token.symbol||'?').padEnd(12)} ${check.fails.join(' · ')}`);
       }
     }
 
     candidates.sort((a, b) => b.check.score - a.check.score);
-    console.log(`[SCAN] ★ ${candidates.length} candidatos válidos ★`);
+    console.log(`[SCAN] ★ ${candidates.length} candidatos`);
 
     for (const { token, check, mint } of candidates) {
       if (positions.size >= MAX_POSITIONS) break;
@@ -229,13 +218,13 @@ async function scanRecentTokens() {
           openedAt: Date.now(),
           signature: result.signature,
         });
+        const expiresIn = Math.round(MAX_HOLD_MS / 60000);
         await notify(
           `🎯 *ENTRADA* \`${sym}\` ★${check.score}/100\n` +
           `💰 ${SOL_PER_TRADE} SOL · ⏱ ${check.ageMin.toFixed(1)}min\n` +
           `💧 Liq: $${Math.round(check.liq)}\n` +
-          (check.vol1h > 0 ? `📊 Vol1h: $${Math.round(check.vol1h)}\n` : '') +
-          (check.change5m !== 0 ? `📈 ${check.change5m >= 0 ? '+' : ''}${check.change5m.toFixed(1)}% (5m)\n` : '') +
-          `[Solscan](https://solscan.io/tx/${result.signature}) · [Dex](https://dexscreener.com/solana/${mint})`
+          `⏳ Cierre automático en ${expiresIn}min si no hay TP/SL\n` +
+          `[Solscan](https://solscan.io/tx/${result.signature})`
         );
       } else {
         console.log(`[FAIL] ${sym}: ${result.error}`);
@@ -244,23 +233,33 @@ async function scanRecentTokens() {
     }
 
   } catch (e) {
-    if (e.response?.status === 401) {
-      console.log('[ERROR] API Key Moralis inválida');
-      await notify('❌ *Error* — API Key de Moralis inválida');
-    } else if (e.response?.status === 429) {
-      console.log('[ERROR] Límite Moralis alcanzado');
-    } else {
-      console.log(`[SCAN ERROR] ${e.message}`);
-    }
+    if (e.response?.status === 401) { console.log('[ERROR] Moralis API Key inválida'); await notify('❌ *Error* — API Key de Moralis inválida'); }
+    else if (e.response?.status === 429) { console.log('[ERROR] Límite Moralis alcanzado, esperando...'); }
+    else { console.log(`[SCAN ERROR] ${e.message}`); }
   }
 }
 
-// ── MONITOR POSICIONES (usa DexScreener para precio) ──────────────────────
+// ── MONITOR TP/SL/TIEMPO ───────────────────────────────────────────────────
 async function monitorPositions() {
   if (positions.size === 0) return;
 
   for (const [mint, pos] of positions) {
     try {
+      // ── EXPIRACIÓN POR TIEMPO (1 hora) ─────────────────────────────────
+      const holdTime = Date.now() - pos.openedAt;
+      if (holdTime >= MAX_HOLD_MS) {
+        const r = await trade('sell', mint, pos.remainingSol);
+        if (r.success) {
+          totalExpired++;
+          const heldMin = Math.round(holdTime / 60000);
+          history.push({ ...pos, exitPrice: pos.entryPrice, pnl: 0, type: 'expired', time: Date.now() });
+          positions.delete(mint);
+          await notify(`⏰ *EXPIRADO* \`${pos.symbol}\` — ${heldMin}min · capital liberado para reinvertir`);
+        }
+        continue;
+      }
+
+      // ── PRECIO ─────────────────────────────────────────────────────────
       const { data } = await axios.get(
         `https://api.dexscreener.com/latest/dex/tokens/${mint}`,
         { timeout: 5000, headers: { 'User-Agent': 'Mozilla/5.0' } }
@@ -271,10 +270,12 @@ async function monitorPositions() {
       const price = parseFloat(pair.priceUsd) || pos.entryPrice;
       if (price <= 0) continue;
 
-      const pnl = ((price - pos.entryPrice) / pos.entryPrice) * 100;
+      const pnl   = ((price - pos.entryPrice) / pos.entryPrice) * 100;
       if (price > pos.peakPrice) pos.peakPrice = price;
       const dropFromPeak = ((price - pos.peakPrice) / pos.peakPrice) * 100;
+      const timeLeft     = Math.round((MAX_HOLD_MS - holdTime) / 60000);
 
+      // TP3 MOONSHOT
       if (pnl >= TP3_PERCENT) {
         const r = await trade('sell', mint, pos.remainingSol);
         if (r.success) {
@@ -284,37 +285,46 @@ async function monitorPositions() {
           positions.delete(mint);
           await notify(`🚀🌙 *MOONSHOT* \`${pos.symbol}\` +${pnl.toFixed(0)}%\n💎 ${(gained * VAULT_TP3).toFixed(4)} SOL al vault`);
         }
+      // TP2
       } else if (pnl >= TP2_PERCENT && !pos.tp2Done) {
-        const r = await trade('sell', mint, pos.remainingSol * 0.4);
+        const r = await trade('sell', mint, pos.remainingSol);
         if (r.success) {
-          pos.tp2Done = true;
-          pos.remainingSol *= 0.6;
-          await notify(`💰 *TP2* \`${pos.symbol}\` +${pnl.toFixed(0)}%`);
+          const gained = pos.remainingSol * (1 + pnl / 100);
+          vaultSol += gained * VAULT_TP2;
+          history.push({ ...pos, exitPrice: price, pnl, type: 'tp2', time: Date.now() });
+          positions.delete(mint);
+          await notify(`💰 *TP2* \`${pos.symbol}\` +${pnl.toFixed(0)}% · capital libre`);
         }
+      // TP1
       } else if (pnl >= TP1_PERCENT && !pos.tp1Done) {
-        const r = await trade('sell', mint, pos.remainingSol * 0.3);
+        const r = await trade('sell', mint, pos.remainingSol * 0.5);
         if (r.success) {
+          const gained = pos.remainingSol * 0.5 * (1 + pnl / 100);
+          vaultSol += gained * VAULT_TP1;
           pos.tp1Done = true;
-          pos.remainingSol *= 0.7;
-          await notify(`💸 *TP1* \`${pos.symbol}\` +${pnl.toFixed(0)}%`);
+          pos.remainingSol *= 0.5;
+          await notify(`💸 *TP1* \`${pos.symbol}\` +${pnl.toFixed(0)}% · mitad vendida · ${timeLeft}min restantes`);
         }
+      // TRAILING
       } else if (pnl >= TRAIL_ACTIVATE && dropFromPeak <= -TRAIL_DROP) {
         const r = await trade('sell', mint, pos.remainingSol);
         if (r.success) {
           history.push({ ...pos, exitPrice: price, pnl, type: 'trailing', time: Date.now() });
           positions.delete(mint);
-          await notify(`📉 *Trailing* \`${pos.symbol}\` +${pnl.toFixed(0)}%`);
+          await notify(`📉 *Trailing* \`${pos.symbol}\` +${pnl.toFixed(0)}% · capital libre`);
         }
+      // STOP LOSS
       } else if (pnl <= SL_PERCENT) {
         const r = await trade('sell', mint, pos.remainingSol);
         if (r.success) {
           history.push({ ...pos, exitPrice: price, pnl, type: 'stop_loss', time: Date.now() });
           positions.delete(mint);
-          await notify(`🛑 *SL* \`${pos.symbol}\` ${pnl.toFixed(0)}%`);
+          await notify(`🛑 *SL* \`${pos.symbol}\` ${pnl.toFixed(0)}% · capital libre`);
         }
       } else {
-        console.log(`[POS] ${pos.symbol.padEnd(10)} ${pnl >= 0 ? '+' : ''}${pnl.toFixed(1)}%`);
+        console.log(`[POS] ${pos.symbol.padEnd(10)} ${pnl>=0?'+':''}${pnl.toFixed(1)}% · ⏳${timeLeft}min`);
       }
+
     } catch (e) { /* skip */ }
   }
 }
@@ -327,26 +337,31 @@ setInterval(monitorPositions, 20000);
 app.get('/', async (req, res) => {
   const balance = await getSolBalance();
   res.json({
-    status: botPaused ? '⏸ PAUSADO' : '✅ CAZANDO',
-    version: 'v7 — Moralis API',
-    wallet: wallet?.publicKey.toBase58() || 'sin-wallet',
-    moralis_configured: !!MORALIS_API_KEY,
-    balance_sol: balance.toFixed(4),
-    vault_sol: vaultSol.toFixed(4),
-    stats: { scans: totalScans, buys: totalBuys, skips: totalSkips },
-    positions_open: positions.size,
+    status:   botPaused ? '⏸ PAUSADO' : '✅ CAZANDO',
+    version:  'v8 — rotación continua',
+    wallet:   wallet?.publicKey.toBase58() || 'sin-wallet',
+    balance_sol:   balance.toFixed(4),
+    vault_sol:     vaultSol.toFixed(4),
+    stats: {
+      scans: totalScans, buys: totalBuys,
+      skips: totalSkips, expired: totalExpired,
+      open: positions.size,
+    },
+    config: {
+      sl:       `${SL_PERCENT}%`,
+      tp1:      `+${TP1_PERCENT}%`,
+      tp2:      `+${TP2_PERCENT}%`,
+      tp3:      `+${TP3_PERCENT}%`,
+      max_hold: `${MAX_HOLD_MS/60000}min`,
+    },
     positions: Array.from(positions.values()).map(p => ({
-      symbol: p.symbol, score: p.score,
-      age_min: Math.floor((Date.now() - p.openedAt) / 60000),
-      tp1: p.tp1Done, tp2: p.tp2Done,
+      symbol:   p.symbol,
+      score:    p.score,
+      age_min:  Math.floor((Date.now() - p.openedAt) / 60000),
+      time_left_min: Math.round((MAX_HOLD_MS - (Date.now() - p.openedAt)) / 60000),
+      tp1: p.tp1Done,
     })),
-    history_last_5: history.slice(-5),
-    filters: {
-      age: `${MIN_AGE_MINUTES}-${MAX_AGE_MINUTES}min`,
-      liquidity: `>$${MIN_LIQUIDITY_USD}`,
-      volume_1h: `>$${MIN_VOLUME_1H_USD}`,
-      mcap_ratio: `<${MAX_MCAP_LIQ_RATIO}x`,
-    }
+    history_last_10: history.slice(-10),
   });
 });
 
@@ -359,15 +374,16 @@ app.post('/resume', (req, res) => {
 // ── START ──────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`🚀 MoonShot €20 Bot v7 (Moralis) — puerto ${PORT}`);
+  console.log(`🚀 MoonShot €20 Bot v8 — ROTACIÓN CONTINUA — puerto ${PORT}`);
+  console.log(`⚙️  SL:${SL_PERCENT}% · TP1:+${TP1_PERCENT}% · TP2:+${TP2_PERCENT}% · MAX:${MAX_HOLD_MS/60000}min`);
   if (wallet) console.log(`👛 Wallet: ${wallet.publicKey.toBase58()}`);
-  if (MORALIS_API_KEY) console.log(`🔑 Moralis API: configurada`);
-  else console.log('⚠️  Falta MORALIS_API_KEY');
+  else console.log('⚠️  Sin WALLET_PRIVATE_KEY');
   await notify(
-    '🚀 *Bot v7 activado — Moralis*\n' +
-    `✅ API: ${MORALIS_API_KEY ? 'configurada' : '❌ falta'}\n` +
-    '✅ Tokens nuevos reales de PumpFun\n' +
-    `📊 ${MIN_AGE_MINUTES}-${MAX_AGE_MINUTES}min · liq>$${MIN_LIQUIDITY_USD}`
+    '🚀 *Bot v8 — Rotación Continua*\n' +
+    `🔄 Máx por posición: ${MAX_HOLD_MS/60000}min\n` +
+    `🛑 Stop loss: ${SL_PERCENT}%\n` +
+    `💸 TP1: +${TP1_PERCENT}% · TP2: +${TP2_PERCENT}% · TP3: +${TP3_PERCENT}%\n` +
+    '📡 Moralis API · DexScreener monitor'
   );
   scanRecentTokens();
 });
