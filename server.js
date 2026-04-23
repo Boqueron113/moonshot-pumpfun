@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════════════════════════════
-// MOONSHOT €20 — PumpFun bot v5 (corregido)
-// Fix: endpoint correcto de DexScreener + pairCreatedAt en vez de pairAge
+// MOONSHOT €20 — PumpFun bot v6
+// Fix: usar endpoint token-boosts + fetchear detalles individuales con liq real
 // ═══════════════════════════════════════════════════════════════════════════
 
 const express = require('express');
@@ -21,7 +21,7 @@ const TELEGRAM_CHAT_ID   = process.env.TELEGRAM_CHAT_ID;
 const SOL_PER_TRADE  = 0.006;
 const MAX_POSITIONS  = 15;
 const RESERVE_SOL    = 0.02;
-const SCAN_INTERVAL  = 45000;
+const SCAN_INTERVAL  = 60000; // 1 min
 
 const TP1_PERCENT    = 40;
 const TP2_PERCENT    = 120;
@@ -31,13 +31,13 @@ const TRAIL_ACTIVATE = 80;
 const TRAIL_DROP     = 25;
 
 // Filtros
-const MIN_LIQUIDITY_USD  = 5000;
+const MIN_LIQUIDITY_USD  = 3000;   // $3k mínimo
 const MIN_AGE_MINUTES    = 3;
-const MAX_AGE_MINUTES    = 30;
-const MIN_VOLUME_1H_USD  = 5000;   // bajado de 10k a 5k (más realista)
-const MAX_MCAP_LIQ_RATIO = 10;
-const MIN_PRICE_CHANGE   = 3;      // bajado de 5 a 3 (más flexible)
-const MAX_PRICE_CHANGE   = 300;
+const MAX_AGE_MINUTES    = 60;     // ampliado a 1 hora
+const MIN_VOLUME_1H_USD  = 3000;   // $3k volumen 1h
+const MAX_MCAP_LIQ_RATIO = 15;     // más permisivo
+const MIN_PRICE_CHANGE   = 2;
+const MAX_PRICE_CHANGE   = 500;
 
 const VAULT_TP1 = 0.5;
 const VAULT_TP2 = 0.6;
@@ -73,25 +73,24 @@ async function notify(msg) {
 // ── SCORE ──────────────────────────────────────────────────────────────────
 function scoreToken(ageMin, liq, ratio, change5m) {
   let score = 0;
-  score += Math.max(0, 100 - Math.abs(ageMin - 10) * 6) * 0.3;
-  score += Math.min(100, (liq / 50000) * 100) * 0.3;
+  score += Math.max(0, 100 - Math.abs(ageMin - 15) * 4) * 0.3;
+  score += Math.min(100, (liq / 30000) * 100) * 0.3;
   score += Math.max(0, (MAX_MCAP_LIQ_RATIO - ratio) / MAX_MCAP_LIQ_RATIO * 100) * 0.2;
   score += Math.max(0, Math.min(100, change5m * 2)) * 0.2;
   return Math.round(score);
 }
 
 // ── FILTROS ────────────────────────────────────────────────────────────────
-function filterToken(pair) {
+function filterPair(pair) {
   const fails = [];
 
   if (pair.chainId !== 'solana') fails.push('no-solana');
 
-  // Edad — DexScreener devuelve pairCreatedAt (timestamp en ms)
   const ageMin = pair.pairCreatedAt
     ? (Date.now() - pair.pairCreatedAt) / 60000
     : 999;
   if (ageMin < MIN_AGE_MINUTES) fails.push(`joven:${ageMin.toFixed(1)}m`);
-  if (ageMin > MAX_AGE_MINUTES) fails.push(`viejo:${ageMin.toFixed(1)}m`);
+  if (ageMin > MAX_AGE_MINUTES) fails.push(`viejo:${ageMin.toFixed(0)}m`);
 
   const liq = pair.liquidity?.usd || 0;
   if (liq < MIN_LIQUIDITY_USD) fails.push(`liq:$${Math.round(liq)}`);
@@ -146,7 +145,11 @@ async function getSolBalance() {
   catch { return 0; }
 }
 
-// ── SCAN ──────────────────────────────────────────────────────────────────
+// ── SCAN v6 ────────────────────────────────────────────────────────────────
+// Estrategia: 
+// 1. Pedir token-boosts (top 30 trending en Solana)
+// 2. Para cada uno, fetchear datos completos con /latest/dex/tokens/{mint}
+// 3. Filtrar y comprar los mejores
 async function scanRecentTokens() {
   if (botPaused || positions.size >= MAX_POSITIONS) return;
 
@@ -158,76 +161,112 @@ async function scanRecentTokens() {
   }
 
   totalScans++;
-  console.log(`\n[SCAN #${totalScans}] DexScreener · ${positions.size} posiciones abiertas`);
+  console.log(`\n[SCAN #${totalScans}] DexScreener boosted tokens · ${positions.size} posiciones`);
 
   try {
-    // Endpoint correcto: busca pares de PumpFun en Solana con volumen
-    const { data } = await axios.get(
-      'https://api.dexscreener.com/latest/dex/search?q=pumpfun',
-      {
-        timeout: 10000,
-        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Bot/1.0)' }
-      }
+    // Paso 1: obtener tokens boosted (trending)
+    const boostedRes = await axios.get(
+      'https://api.dexscreener.com/token-boosts/latest/v1',
+      { timeout: 10000, headers: { 'User-Agent': 'Mozilla/5.0' } }
     );
+    
+    const boostedArr = Array.isArray(boostedRes.data) ? boostedRes.data : [];
+    const solanaTokens = boostedArr
+      .filter(t => t.chainId === 'solana' && t.tokenAddress)
+      .slice(0, 30);
 
-    const pairs = data.pairs || [];
-    console.log(`[SCAN] DexScreener devolvió ${pairs.length} pares`);
+    console.log(`[SCAN] ${solanaTokens.length} tokens Solana trending`);
 
-    const candidates = [];
-    for (const pair of pairs) {
-      const mint = pair.baseToken?.address;
-      if (!mint || seenTokens.has(mint)) continue;
-
-      const check = filterToken(pair);
-      if (check.ok) {
-        candidates.push({ pair, check, mint });
-      } else {
-        totalSkips++;
-        const sym = pair.baseToken?.symbol || '?';
-        console.log(`[SKIP] ${sym.padEnd(12)} ${check.fails.join(' · ')}`);
-      }
+    if (solanaTokens.length === 0) {
+      console.log('[SCAN] Sin tokens trending, probando endpoint alternativo...');
+      // Fallback: búsqueda general
+      const fallback = await axios.get(
+        'https://api.dexscreener.com/latest/dex/search?q=SOL',
+        { timeout: 10000, headers: { 'User-Agent': 'Mozilla/5.0' } }
+      );
+      const pairs = (fallback.data.pairs || [])
+        .filter(p => p.chainId === 'solana')
+        .slice(0, 30);
+      
+      await processPairs(pairs);
+      return;
     }
 
-    candidates.sort((a, b) => b.check.score - a.check.score);
-    console.log(`[SCAN] ${candidates.length} candidatos válidos`);
-
-    for (const { pair, check, mint } of candidates) {
-      if (positions.size >= MAX_POSITIONS) break;
-      seenTokens.add(mint);
-      totalBuys++;
-
-      const sym = pair.baseToken?.symbol || 'UNK';
-      console.log(`[BUY ★${check.score}] ${sym} · ${check.ageMin.toFixed(1)}m · liq:$${Math.round(check.liq)} · +${check.change5m.toFixed(1)}%`);
-
-      const result = await trade('buy', mint, SOL_PER_TRADE);
-      if (result.success) {
-        const priceUsd = parseFloat(pair.priceUsd) || 0;
-        positions.set(mint, {
-          mint, symbol: sym,
-          entryPrice: priceUsd,
-          amountSol: SOL_PER_TRADE,
-          remainingSol: SOL_PER_TRADE,
-          peakPrice: priceUsd,
-          score: check.score,
-          tp1Done: false, tp2Done: false,
-          openedAt: Date.now(),
-          signature: result.signature,
-        });
-        await notify(
-          `🎯 *ENTRADA* \`${sym}\` ★${check.score}/100\n` +
-          `💰 ${SOL_PER_TRADE} SOL · ⏱ ${check.ageMin.toFixed(1)}min\n` +
-          `💧 Liq: $${Math.round(check.liq)} · 📊 Vol1h: $${Math.round(check.vol1h)}\n` +
-          `📈 +${check.change5m.toFixed(1)}% (5m) · ratio:${check.ratio.toFixed(1)}x\n` +
-          `[Solscan](https://solscan.io/tx/${result.signature}) · [Dex](https://dexscreener.com/solana/${mint})`
+    // Paso 2: fetchear datos completos de cada token trending
+    const pairs = [];
+    for (const t of solanaTokens) {
+      if (seenTokens.has(t.tokenAddress)) continue;
+      try {
+        const { data } = await axios.get(
+          `https://api.dexscreener.com/latest/dex/tokens/${t.tokenAddress}`,
+          { timeout: 5000, headers: { 'User-Agent': 'Mozilla/5.0' } }
         );
-      } else {
-        console.log(`[FAIL] ${sym}: ${result.error}`);
-      }
-      await new Promise(r => setTimeout(r, 2000));
+        if (data.pairs?.[0]) pairs.push(data.pairs[0]);
+      } catch { /* skip */ }
+      await new Promise(r => setTimeout(r, 200)); // rate limit
     }
+
+    await processPairs(pairs);
 
   } catch (e) {
     console.log(`[SCAN ERROR] ${e.message}`);
+  }
+}
+
+async function processPairs(pairs) {
+  console.log(`[SCAN] Procesando ${pairs.length} pares con datos completos`);
+  
+  const candidates = [];
+  for (const pair of pairs) {
+    const mint = pair.baseToken?.address;
+    if (!mint || seenTokens.has(mint)) continue;
+
+    const check = filterPair(pair);
+    if (check.ok) {
+      candidates.push({ pair, check, mint });
+    } else {
+      totalSkips++;
+      const sym = pair.baseToken?.symbol || '?';
+      console.log(`[SKIP] ${sym.padEnd(10)} ${check.fails.join(' · ')}`);
+    }
+  }
+
+  candidates.sort((a, b) => b.check.score - a.check.score);
+  console.log(`[SCAN] ★ ${candidates.length} candidatos válidos ★`);
+
+  for (const { pair, check, mint } of candidates) {
+    if (positions.size >= MAX_POSITIONS) break;
+    seenTokens.add(mint);
+    totalBuys++;
+
+    const sym = pair.baseToken?.symbol || 'UNK';
+    console.log(`[BUY ★${check.score}] ${sym} · ${check.ageMin.toFixed(1)}m · liq:$${Math.round(check.liq)} · +${check.change5m.toFixed(1)}%`);
+
+    const result = await trade('buy', mint, SOL_PER_TRADE);
+    if (result.success) {
+      const priceUsd = parseFloat(pair.priceUsd) || 0;
+      positions.set(mint, {
+        mint, symbol: sym,
+        entryPrice: priceUsd,
+        amountSol: SOL_PER_TRADE,
+        remainingSol: SOL_PER_TRADE,
+        peakPrice: priceUsd,
+        score: check.score,
+        tp1Done: false, tp2Done: false,
+        openedAt: Date.now(),
+        signature: result.signature,
+      });
+      await notify(
+        `🎯 *ENTRADA* \`${sym}\` ★${check.score}/100\n` +
+        `💰 ${SOL_PER_TRADE} SOL · ⏱ ${check.ageMin.toFixed(1)}min\n` +
+        `💧 Liq: $${Math.round(check.liq)} · 📊 Vol1h: $${Math.round(check.vol1h)}\n` +
+        `📈 +${check.change5m.toFixed(1)}% (5m)\n` +
+        `[Solscan](https://solscan.io/tx/${result.signature}) · [Dex](https://dexscreener.com/solana/${mint})`
+      );
+    } else {
+      console.log(`[FAIL] ${sym}: ${result.error}`);
+    }
+    await new Promise(r => setTimeout(r, 2000));
   }
 }
 
@@ -304,7 +343,7 @@ app.get('/', async (req, res) => {
   const balance = await getSolBalance();
   res.json({
     status: botPaused ? '⏸ PAUSADO' : '✅ CAZANDO',
-    version: 'v5 — DexScreener fixed',
+    version: 'v6 — trending + detalles',
     wallet: wallet?.publicKey.toBase58() || 'sin-wallet',
     balance_sol: balance.toFixed(4),
     vault_sol: vaultSol.toFixed(4),
@@ -316,13 +355,6 @@ app.get('/', async (req, res) => {
       tp1: p.tp1Done, tp2: p.tp2Done,
     })),
     history_last_5: history.slice(-5),
-    filters: {
-      age_min: `${MIN_AGE_MINUTES}-${MAX_AGE_MINUTES}min`,
-      liquidity: `>$${MIN_LIQUIDITY_USD}`,
-      volume_1h: `>$${MIN_VOLUME_1H_USD}`,
-      momentum_5m: `+${MIN_PRICE_CHANGE}% a +${MAX_PRICE_CHANGE}%`,
-      max_ratio: `${MAX_MCAP_LIQ_RATIO}x`,
-    }
   });
 });
 
@@ -335,14 +367,14 @@ app.post('/resume', (req, res) => {
 // ── START ──────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`🚀 MoonShot €20 Bot v5 — puerto ${PORT}`);
+  console.log(`🚀 MoonShot €20 Bot v6 — puerto ${PORT}`);
   if (wallet) console.log(`👛 Wallet: ${wallet.publicKey.toBase58()}`);
   else console.log('⚠️  Sin WALLET_PRIVATE_KEY');
   await notify(
-    '🚀 *Bot v5 activado — corregido*\n' +
-    '✅ Endpoint DexScreener correcto\n' +
-    '✅ Cálculo de edad con pairCreatedAt\n' +
-    `📊 Filtros: ${MIN_AGE_MINUTES}-${MAX_AGE_MINUTES}min · liq>$${MIN_LIQUIDITY_USD} · vol>$${MIN_VOLUME_1H_USD} · mom>+${MIN_PRICE_CHANGE}%`
+    '🚀 *Bot v6 activado*\n' +
+    '✅ Fix: obtiene liquidez real\n' +
+    '✅ Usa trending tokens Solana\n' +
+    `📊 ${MIN_AGE_MINUTES}-${MAX_AGE_MINUTES}min · liq>$${MIN_LIQUIDITY_USD} · vol>$${MIN_VOLUME_1H_USD}`
   );
   scanRecentTokens();
 });
